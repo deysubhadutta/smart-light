@@ -558,7 +558,7 @@ footer {
     </div>
   </div>
 
-  <footer>SYS:ONLINE &nbsp;·&nbsp; Firebase Realtime DB &nbsp;·&nbsp; PIR Motion &nbsp;·&nbsp; v4.0</footer>
+  <footer>SYS:ONLINE &nbsp;·&nbsp; Firebase Realtime DB &nbsp;·&nbsp; PIR Motion &nbsp;·&nbsp; v4.1</footer>
 </div>
 
 <script>
@@ -570,7 +570,13 @@ footer {
   var cardsInitialized = false;
   var sseSource        = null;
   var staleTimers      = {};
-  var STALE_MS         = 15000;
+
+  // ── FIX: STALE_MS raised from 15s → 5 minutes.
+  // The old 15s value was shorter than a typical PIR ON-cycle, so the
+  // dashboard's own timer was flipping cards to OFF before Firebase
+  // could send the real OFF event. 5 minutes only catches genuine
+  // connection loss; the SSE stream handles all real state changes.
+  var STALE_MS = 300000;
 
   // ── Theme ──
   function toggleTheme() {
@@ -601,7 +607,6 @@ footer {
     if (diff < 0) return '—';
     return Math.floor(diff/3600)+'h '+Math.floor((diff%3600)/60)+'m '+Math.floor(diff%60)+'s';
   }
-  // Convert hours (float from firmware) to readable minutes/seconds for display
   function fmtIntervalHours(h) {
     if (h === 0) return '0s';
     var totalSec = Math.round(h * 3600);
@@ -674,7 +679,7 @@ footer {
     cardEl.querySelector('.c-updated').textContent = 'Updated: ' + fmtTime(d.lastUpdated);
   }
 
-  // ── Force a device card to OFF when stale ──
+  // ── Force a device card to OFF when stale (only fires after STALE_MS of silence) ──
   function markDeviceStale(deviceID) {
     var cardEl = document.querySelector('[data-device="'+deviceID+'"]');
     if (!cardEl) return;
@@ -698,7 +703,7 @@ footer {
       new Date().toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});
   }
 
-  // ── Reset stale timer ──
+  // ── Reset stale timer (now fires at 5 min, not 15s) ──
   function resetStaleTimer(deviceID) {
     if (staleTimers[deviceID]) clearTimeout(staleTimers[deviceID]);
     staleTimers[deviceID] = setTimeout(function() {
@@ -727,10 +732,11 @@ footer {
       var d = devMap[id];
       if (!d || !d.device) return;
 
-      var lastUpdate = new Date(d.lastUpdated).getTime();
-      if (isNaN(lastUpdate) || (Date.now() - lastUpdate > STALE_MS)) {
-        d.status = 'OFF';
-      }
+      // ── FIX: Removed the stale lastUpdated check that was here ──
+      // The old code did:
+      //   if (Date.now() - new Date(d.lastUpdated) > STALE_MS) d.status = 'OFF'
+      // This silently overrode the real Firebase status with OFF every time
+      // an SSE event arrived after 15s. Now we trust the stream completely.
 
       devicesCache[d.device] = d;
       resetStaleTimer(d.device);
@@ -826,7 +832,6 @@ footer {
             allLogs.push({
               device:   dev,
               time:     e.time     || '',
-              // Store raw hours from firmware (per-interval, ~0–0.0167h max)
               active:   parseFloat(e.active)   || 0,
               inactive: parseFloat(e.inactive) || 0,
               peak:     parseFloat(e.peak)     || 0
@@ -854,11 +859,10 @@ footer {
     }
     var html = '';
     rows.forEach(function(r, i){
-      // Convert hours → minutes for display (each interval is max 1 min = 60s)
       var activeSec   = Math.round(r.active   * 3600);
       var inactiveSec = Math.round(r.inactive * 3600);
       var peakSec     = Math.round(r.peak     * 3600);
-      var barW        = Math.min(activeSec, 60); // max bar = 60s
+      var barW        = Math.min(activeSec, 60);
       html += `<tr>
         <td style="color:var(--muted);font-size:.7rem">${String(i+1).padStart(2,'0')}</td>
         <td><span class="badge badge-on">${r.device}</span></td>
@@ -871,7 +875,7 @@ footer {
     document.getElementById('logsBody').innerHTML = html;
   }
 
-  // ── Charts — matching admin_fixed.html style exactly (no neon) ──
+  // ── Charts ──
   function buildCharts() {
     if (!allLogs.length) return;
 
@@ -882,11 +886,10 @@ footer {
 
     Chart.defaults.font.family = "'DM Mono', monospace";
 
-    // Aggregate per device: sum active/inactive (in minutes), max peak
     var devMap = {};
     allLogs.forEach(function(r){
       if (!devMap[r.device]) devMap[r.device] = {active:0, inactive:0, peak:0};
-      devMap[r.device].active   += r.active * 60;   // convert to minutes
+      devMap[r.device].active   += r.active * 60;
       devMap[r.device].inactive += r.inactive * 60;
       if (r.peak * 60 > devMap[r.device].peak) devMap[r.device].peak = r.peak * 60;
     });
@@ -896,23 +899,6 @@ footer {
     var inactArr = labels.map(k => +devMap[k].inactive.toFixed(1));
     var peakArr  = labels.map(k => +devMap[k].peak.toFixed(1));
 
-    var co = {
-      responsive: true,
-      maintainAspectRatio: false,
-      plugins: {
-        legend: { display: false },
-        tooltip: {
-          backgroundColor: bgColor,
-          callbacks: { label: c => c.parsed.y + ' min' }
-        }
-      },
-      scales: {
-        x: { grid: { color: gridColor, display: false }, ticks: { color: textColor } },
-        y: { grid: { color: gridColor }, border: { dash: [4,4] }, ticks: { color: textColor }, beginAtZero: true }
-      }
-    };
-
-    // Bar chart — Active vs Inactive (grouped)
     if (chartBar) chartBar.destroy();
     chartBar = new Chart(document.getElementById('chartBar'), {
       type: 'bar',
@@ -934,7 +920,6 @@ footer {
       }
     });
 
-    // Donut — overall usage share
     var totActive   = actArr.reduce((a,b)=>a+b, 0);
     var totInactive = inactArr.reduce((a,b)=>a+b, 0);
     if (chartDoughnut) chartDoughnut.destroy();
@@ -960,7 +945,6 @@ footer {
       }
     });
 
-    // Horizontal bar — Peak streak per device
     if (chartPeak) chartPeak.destroy();
     chartPeak = new Chart(document.getElementById('chartPeak'), {
       type: 'bar',
